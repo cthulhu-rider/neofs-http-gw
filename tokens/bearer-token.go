@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 
 	"github.com/nspcc-dev/neofs-sdk-go/token"
@@ -62,11 +61,9 @@ func StoreBearerToken(ctx *fasthttp.RequestCtx) error {
 
 // LoadBearerToken returns bearer token stored in context given (if it's
 // present there).
-func LoadBearerToken(ctx context.Context) (*token.BearerToken, error) {
-	if tkn, ok := ctx.Value(bearerTokenKey).(*token.BearerToken); ok && tkn != nil {
-		return tkn, nil
-	}
-	return nil, errors.New("found empty bearer token")
+func LoadBearerToken(ctx context.Context) *token.BearerToken {
+	tkn, _ := ctx.Value(bearerTokenKey).(*token.BearerToken)
+	return tkn
 }
 
 func fetchBearerToken(ctx *fasthttp.RequestCtx) (*token.BearerToken, error) {
@@ -97,4 +94,34 @@ func fetchBearerToken(ctx *fasthttp.RequestCtx) (*token.BearerToken, error) {
 	}
 
 	return nil, lastErr
+}
+
+// ReadBearer reads JSON-encoded bearer token from the HTTP request header and returns:
+//   -1 if token is incorrect;
+//   0 if token is missing;
+//   1 otherwise.
+func ReadBearer(dst *[]byte, hdr *fasthttp.RequestHeader) int8 {
+	var b64Bearer []byte
+
+	const prefix = bearerTokenHdr + " "
+	bPrefix := []byte(prefix)
+
+	if hdrAuth := hdr.Peek(fasthttp.HeaderAuthorization); bytes.HasPrefix(hdrAuth, bPrefix) {
+		b64Bearer = bytes.TrimPrefix(hdrAuth, bPrefix)
+	} else {
+		b64Bearer = hdr.Cookie(bearerTokenHdr)
+	}
+
+	if b64Bearer == nil {
+		return 0
+	}
+
+	*dst = make([]byte, base64.StdEncoding.DecodedLen(len(b64Bearer)))
+
+	_, err := base64.StdEncoding.Decode(*dst, b64Bearer)
+	if err != nil {
+		return -1
+	}
+
+	return 1
 }

@@ -1,232 +1,355 @@
 package uploader
 
 import (
-	"context"
-	"encoding/binary"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
+	"mime/multipart"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nspcc-dev/neofs-http-gw/response"
 	"github.com/nspcc-dev/neofs-http-gw/tokens"
 	"github.com/nspcc-dev/neofs-http-gw/utils"
-	"github.com/nspcc-dev/neofs-sdk-go/client"
-	apistatus "github.com/nspcc-dev/neofs-sdk-go/client/status"
-	cid "github.com/nspcc-dev/neofs-sdk-go/container/id"
-	"github.com/nspcc-dev/neofs-sdk-go/netmap"
-	"github.com/nspcc-dev/neofs-sdk-go/object"
-	"github.com/nspcc-dev/neofs-sdk-go/owner"
-	"github.com/nspcc-dev/neofs-sdk-go/pool"
-	"github.com/nspcc-dev/neofs-sdk-go/token"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 )
 
-const (
-	jsonHeader   = "application/json; charset=UTF-8"
-	drainBufSize = 4096
-)
+// PrmInit groups initialization parameters of the Uploader.
+type PrmInit struct {
+	neoFS NeoFS
+
+	defaultTimestamp bool
+
+	logger *zap.Logger
+}
+
+// SetNeoFS sets NeoFS component used to store the objects.
+// Required parameter.
+func (x *PrmInit) SetNeoFS(neoFS NeoFS) {
+	x.neoFS = neoFS
+}
+
+// SetLogger sets component to write log messages.
+// By default, log messages are not written.
+func (x *PrmInit) SetLogger(logger *zap.Logger) {
+	x.logger = logger
+}
+
+// EnableDefaultTimestamping sets flag which makes Uploader to
+// set object timestamps in case of their lack.
+func (x *PrmInit) EnableDefaultTimestamping() {
+	x.defaultTimestamp = true
+}
 
 // Uploader is an upload request handler.
 type Uploader struct {
-	log                    *zap.Logger
-	pool                   pool.Pool
-	enableDefaultTimestamp bool
+	neoFS NeoFS
+
+	defaultTimestamp bool
+
+	logger *zap.Logger
 }
 
-type epochDurations struct {
-	currentEpoch  uint64
-	msPerBlock    int64
-	blockPerEpoch uint64
+// Init initializes Uploader.
+//
+// Panics if NeoFS instance is not set or nil.
+//
+// If logger is not specified, no-op logger is used.
+func (x *Uploader) Init(prm PrmInit) {
+	if prm.neoFS == nil {
+		panic("init uploader: NeoFS component is unset/nil")
+	}
+
+	x.neoFS = prm.neoFS
+	x.defaultTimestamp = prm.defaultTimestamp
+
+	if prm.logger != nil {
+		x.logger = prm.logger
+	} else {
+		x.logger = zap.NewNop()
+	}
 }
 
-// New creates a new Uploader using specified logger, connection pool and
-// other options.
-func New(log *zap.Logger, conns pool.Pool, enableDefaultTimestamp bool) *Uploader {
-	return &Uploader{log, conns, enableDefaultTimestamp}
+type uploadContext struct {
+	// processing request, embedded to use uploadContext as context.Context
+	*fasthttp.RequestCtx
+	// global failure flag
+	fail bool
+	// failure reason
+	err error
+	// response data
+	resp struct {
+		ObjectID    string `json:"object_id"`
+		ContainerID string `json:"container_id"`
+	}
+	// logger for request context
+	logger *zap.Logger
+	// payload source
+	srcPayload interface {
+		io.ReadCloser
+		FileName() string
+	}
+	// component to form and store object
+	creator ObjectCreator
+	// flag to write creation time of the object if header is missing
+	defaultTimestamp bool
+}
+
+func failRequest(ctx *uploadContext, msg string) {
+	response.Error(ctx.RequestCtx, msg, fasthttp.StatusBadRequest)
+
+	if ctx.err != nil {
+		ctx.logger.Error(msg,
+			zap.String("container", ctx.resp.ContainerID),
+			zap.Error(ctx.err),
+		)
+	}
+}
+
+func failExpiration(ctx *uploadContext) {
+	failRequest(ctx, "problem with expiration header, try expiration in epoch")
+}
+
+func initPayloadSource(ctx *uploadContext) {
+	reader := multipart.NewReader(
+		ctx.RequestBodyStream(),
+		string(ctx.Request.Header.MultipartFormBoundary()),
+	)
+
+	var part *multipart.Part
+
+	for {
+		part, ctx.err = reader.NextPart()
+		if ctx.fail = ctx.err != nil; ctx.fail {
+			return
+		}
+
+		if part.FormName() == "" || part.FileName() == "" {
+			continue
+		}
+
+		ctx.srcPayload = part
+	}
 }
 
 // Upload handles multipart upload request.
-func (u *Uploader) Upload(c *fasthttp.RequestCtx) {
-	var (
-		err        error
-		file       MultipartFile
-		obj        *object.ID
-		addr       = object.NewAddress()
-		cid        = cid.New()
-		scid, _    = c.UserValue("cid").(string)
-		log        = u.log.With(zap.String("cid", scid))
-		bodyStream = c.RequestBodyStream()
-		drainBuf   = make([]byte, drainBufSize)
-	)
-	if err = tokens.StoreBearerToken(c); err != nil {
-		log.Error("could not fetch bearer token", zap.Error(err))
-		response.Error(c, "could not fetch bearer token", fasthttp.StatusBadRequest)
+func (x *Uploader) Upload(c *fasthttp.RequestCtx) {
+	// init upload context
+	var ctx uploadContext
+
+	ctx.logger = x.logger
+	ctx.RequestCtx = c
+	ctx.creator = x.neoFS.InitObjectCreation(ctx)
+	ctx.defaultTimestamp = x.defaultTimestamp
+
+	// bind container
+	ctx.resp.ContainerID, _ = c.UserValue("cid").(string) // check emptiness?
+
+	ctx.creator.IntoContainer(&ctx.fail, ctx.resp.ContainerID)
+	if ctx.fail {
+		failRequest(&ctx, "incorrect container ID")
 		return
 	}
-	if err = cid.Parse(scid); err != nil {
-		log.Error("wrong container id", zap.Error(err))
-		response.Error(c, "wrong container id", fasthttp.StatusBadRequest)
+
+	// read bearer token
+	switch encodedBearer := []byte(nil); tokens.ReadBearer(&encodedBearer, &c.Request.Header) {
+	case -1:
+		failRequest(&ctx, "incorrect bearer token header")
 		return
-	}
-	defer func() {
-		// If the temporary reader can be closed - let's close it.
-		if file == nil {
-			return
-		}
-		err := file.Close()
-		log.Debug(
-			"close temporary multipart/form file",
-			zap.Stringer("address", addr),
-			zap.String("filename", file.FileName()),
-			zap.Error(err),
-		)
-	}()
-	boundary := string(c.Request.Header.MultipartFormBoundary())
-	if file, err = fetchMultipartFile(u.log, bodyStream, boundary); err != nil {
-		log.Error("could not receive multipart/form", zap.Error(err))
-		response.Error(c, "could not receive multipart/form: "+err.Error(), fasthttp.StatusBadRequest)
-		return
-	}
-	filtered := filterHeaders(u.log, &c.Request.Header)
-	if needParseExpiration(filtered) {
-		epochDuration, err := getEpochDurations(c, u.pool)
-		if err != nil {
-			log.Error("could not get epoch durations from network info", zap.Error(err))
-			response.Error(c, "could parse expiration header, try expiration in epoch", fasthttp.StatusBadRequest)
-			return
-		}
-		if err = prepareExpirationHeader(filtered, epochDuration); err != nil {
-			log.Error("could not prepare expiration header", zap.Error(err))
-			response.Error(c, "could parse expiration header, try expiration in epoch", fasthttp.StatusBadRequest)
+	case 1:
+		if ctx.creator.UseBearerToken(&ctx.fail, encodedBearer); ctx.fail {
+			failRequest(&ctx, "incorrect bearer token JSON")
 			return
 		}
 	}
 
-	attributes := make([]*object.Attribute, 0, len(filtered))
-	// prepares attributes from filtered headers
-	for key, val := range filtered {
-		attribute := object.NewAttribute()
-		attribute.SetKey(key)
-		attribute.SetValue(val)
-		attributes = append(attributes, attribute)
-	}
-	// sets FileName attribute if it wasn't set from header
-	if _, ok := filtered[object.AttributeFileName]; !ok {
-		filename := object.NewAttribute()
-		filename.SetKey(object.AttributeFileName)
-		filename.SetValue(file.FileName())
-		attributes = append(attributes, filename)
-	}
-	// sets Timestamp attribute if it wasn't set from header and enabled by settings
-	if _, ok := filtered[object.AttributeTimestamp]; !ok && u.enableDefaultTimestamp {
-		timestamp := object.NewAttribute()
-		timestamp.SetKey(object.AttributeTimestamp)
-		timestamp.SetValue(strconv.FormatInt(time.Now().Unix(), 10))
-		attributes = append(attributes, timestamp)
-	}
-	oid, bt := u.fetchOwnerAndBearerToken(c)
-
-	rawObject := object.NewRaw()
-	rawObject.SetContainerID(cid)
-	rawObject.SetOwnerID(oid)
-	rawObject.SetAttributes(attributes...)
-
-	ops := new(client.PutObjectParams).WithObject(rawObject.Object()).WithPayloadReader(file)
-
-	if obj, err = u.pool.PutObject(c, ops, pool.WithBearer(bt)); err != nil {
-		log.Error("could not store file in neofs", zap.Error(err))
-		response.Error(c, "could not store file in neofs", fasthttp.StatusBadRequest)
+	// compose multi-part file
+	initPayloadSource(&ctx)
+	if ctx.fail {
+		failRequest(&ctx, "receive multipart/form")
 		return
 	}
 
-	addr.SetObjectID(obj)
-	addr.SetContainerID(cid)
+	defer ctx.srcPayload.Close()
 
-	// Try to return the response, otherwise, if something went wrong, throw an error.
-	if err = newPutResponse(addr).encode(c); err != nil {
-		log.Error("could not prepare response", zap.Error(err))
-		response.Error(c, "could not prepare response", fasthttp.StatusBadRequest)
+	// provide payload
+	ctx.creator.ReadPayloadFrom(ctx.srcPayload)
 
+	// write headers
+	processHeaders(&ctx)
+
+	// finish creation and save the object in NeoFS
+	ctx.creator.Close(&ctx.fail, &ctx.resp.ObjectID)
+	if ctx.fail {
+		failRequest(&ctx, "store file in NeoFS failed")
 		return
 	}
+
+	// form the response
+	enc := json.NewEncoder(ctx)
+	enc.SetIndent("", "\t")
+
+	ctx.err = enc.Encode(ctx.resp)
+	if ctx.fail = ctx.err != nil; ctx.fail {
+		failRequest(&ctx, "form response failed")
+		return
+	}
+
 	// Multipart is multipart and thus can contain more than one part which
 	// we ignore at the moment. Also, when dealing with chunked encoding
 	// the last zero-length chunk might be left unread (because multipart
 	// reader only cares about its boundary and doesn't look further) and
 	// it will be (erroneously) interpreted as the start of the next
 	// pipelined header. Thus we need to drain the body buffer.
-	for {
-		_, err = bodyStream.Read(drainBuf)
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
-		}
-	}
+	_, _ = io.CopyBuffer(io.Discard, ctx.srcPayload, make([]byte, 4096))
+
 	// Report status code and content type.
 	c.Response.SetStatusCode(fasthttp.StatusOK)
-	c.Response.Header.SetContentType(jsonHeader)
+	c.Response.Header.SetContentType("application/json; charset=UTF-8")
 }
 
-func (u *Uploader) fetchOwnerAndBearerToken(ctx context.Context) (*owner.ID, *token.BearerToken) {
-	if tkn, err := tokens.LoadBearerToken(ctx); err == nil && tkn != nil {
-		return tkn.Issuer(), tkn
-	}
-	return u.pool.OwnerID(), nil
-}
-
-type putResponse struct {
-	ObjectID    string `json:"object_id"`
-	ContainerID string `json:"container_id"`
-}
-
-func newPutResponse(addr *object.Address) *putResponse {
-	return &putResponse{
-		ObjectID:    addr.ObjectID().String(),
-		ContainerID: addr.ContainerID().String(),
+func calcSystemPrefixLen(hdr *Header) {
+	switch hdr.Key {
+	default:
+		hdr.SystemPrefixLen = 0
+	case
+		"Neofs-",
+		"NEOFS-",
+		"neofs-":
+		hdr.SystemPrefixLen = 6
 	}
 }
 
-func (pr *putResponse) encode(w io.Writer) error {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "\t")
-	return enc.Encode(pr)
-}
+func processHeaders(ctx *uploadContext) {
+	type expirationType uint8
 
-func getEpochDurations(ctx context.Context, p pool.Pool) (*epochDurations, error) {
-	if conn, _, err := p.Connection(); err != nil {
-		return nil, err
-	} else if networkInfoRes, err := conn.NetworkInfo(ctx); err != nil {
-		return nil, err
-	} else if err = apistatus.ErrFromStatus(networkInfoRes.Status()); err != nil {
-		return nil, err
-	} else {
-		networkInfo := networkInfoRes.Info()
-		res := &epochDurations{
-			currentEpoch: networkInfo.CurrentEpoch(),
-			msPerBlock:   networkInfo.MsPerBlock(),
+	const (
+		_ expirationType = iota
+		expirationRFC3339
+		expirationTimestamp
+		expirationDuration
+	)
+
+	var (
+		hdr  Header
+		meta HeadersMeta
+
+		exp struct {
+			typ, typCur expirationType
+
+			dur time.Duration
+		}
+	)
+
+	// iterate over all headers
+	ctx.Request.Header.VisitAll(func(k, v []byte) {
+		if ctx.fail {
+			// no other way to abort iteration
+			return
 		}
 
-		networkInfo.NetworkConfig().IterateParameters(func(parameter *netmap.NetworkParameter) bool {
-			if string(parameter.Key()) == "EpochDuration" {
-				data := make([]byte, 8)
-				copy(data, parameter.Value())
-				res.blockPerEpoch = binary.LittleEndian.Uint64(data)
-				return true
+		// skip empty values
+		if len(v) == 0 {
+			return
+		}
+
+		// cut user attribute prefix
+		hdr.Key = strings.TrimPrefix(string(k), utils.UserAttributeHeaderPrefix)
+		if len(hdr.Key) == len(k) {
+			// no prefix
+			return
+		}
+
+		// detect expiration headers
+		switch exp.typCur = 0; hdr.Key {
+		case utils.ExpirationRFC3339Attr:
+			exp.typCur = expirationRFC3339
+		case utils.ExpirationTimestampAttr:
+			exp.typCur = expirationTimestamp
+		case utils.ExpirationDurationAttr:
+			exp.typCur = expirationDuration
+		}
+
+		if exp.typCur > 0 {
+			// 1. check if expiration epoch header has not been already encountered
+			// because it overlaps any other expiration header
+			// 2. check if more prioritized header has not been already processed
+			if !meta.encountered.expiration && exp.typCur >= exp.typ {
+				switch exp.typ = exp.typCur; exp.typ {
+				case expirationRFC3339:
+					var timeExpiration time.Time
+
+					timeExpiration, ctx.err = time.Parse(time.RFC3339, hdr.Value)
+					if ctx.fail = ctx.err != nil; !ctx.fail {
+						exp.dur = timeExpiration.Sub(time.Now().UTC())
+						// value will be checked after the switch statement
+					}
+				case expirationTimestamp:
+					var timestamp int64
+
+					timestamp, ctx.err = strconv.ParseInt(hdr.Value, 10, 64)
+					if ctx.fail = ctx.err != nil; !ctx.fail {
+						exp.dur = time.Unix(timestamp, 0).Sub(time.Now())
+						// value will be checked after the switch statement
+					}
+				case expirationDuration:
+					exp.dur, ctx.err = time.ParseDuration(hdr.Value)
+
+					ctx.fail = ctx.err != nil
+				}
+
+				// check if expiration time is from the future
+				if !ctx.fail && exp.dur <= 0 {
+					ctx.fail = true
+					ctx.err = errors.New("expiration time not from the future")
+				}
+
+				// catch failure
+				if ctx.fail {
+					failExpiration(ctx)
+
+					ctx.logger.Error("incorrect expiration header",
+						zap.String("header", hdr.Key),
+						zap.String("value", hdr.Value),
+						zap.Error(ctx.err),
+					)
+				}
+
+				// we shouldn't write expiration time straightaway because we can
+				// encounter more prioritized header on next iterations
 			}
-			return false
-		})
-		if res.blockPerEpoch == 0 {
-			return nil, fmt.Errorf("not found param: EpochDuration")
-		}
-		return res, nil
-	}
-}
 
-func needParseExpiration(headers map[string]string) bool {
-	_, ok1 := headers[utils.ExpirationDurationAttr]
-	_, ok2 := headers[utils.ExpirationRFC3339Attr]
-	_, ok3 := headers[utils.ExpirationTimestampAttr]
-	return ok1 || ok2 || ok3
+			// we don't write expiration headers to the created objects directly,
+			// we'll do it after all headers are processed
+			return
+		}
+
+		// calculate length of the header's system prefix
+		calcSystemPrefixLen(&hdr)
+
+		hdr.Value = string(v)
+
+		ctx.creator.WriteHeader(&meta, hdr)
+	})
+
+	if !ctx.fail {
+		// write remaining headers
+		if !meta.encountered.expiration {
+			ctx.creator.ExpireAfter(&ctx.fail, exp.dur)
+			if ctx.fail {
+				failExpiration(ctx)
+				return
+			}
+		}
+
+		if !meta.encountered.timestamp && ctx.defaultTimestamp {
+			ctx.creator.CreatedAt(time.Now())
+		}
+
+		if !meta.encountered.filename {
+			ctx.creator.FromFile(ctx.srcPayload.FileName())
+		}
+	}
 }

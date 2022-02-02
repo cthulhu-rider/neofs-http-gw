@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -19,7 +18,8 @@ import (
 	"github.com/nspcc-dev/neofs-sdk-go/client"
 	cid "github.com/nspcc-dev/neofs-sdk-go/container/id"
 	"github.com/nspcc-dev/neofs-sdk-go/object"
-	"github.com/nspcc-dev/neofs-sdk-go/pool"
+	"github.com/nspcc-dev/neofs-sdk-go/object/address"
+	oid "github.com/nspcc-dev/neofs-sdk-go/object/id"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 )
@@ -38,7 +38,7 @@ type (
 		log *zap.Logger
 	}
 
-	objectIDs []*object.ID
+	objectIDs []*oid.ID
 
 	errReader struct {
 		data   []byte
@@ -116,7 +116,7 @@ func isValidValue(s string) bool {
 	return true
 }
 
-func (r request) receiveFile(clnt pool.Object, objectAddress *object.Address) {
+func (r request) receiveFile(neoFS NeoFS, objectAddress *address.Address) {
 	var (
 		err      error
 		dis      = "inline"
@@ -180,18 +180,18 @@ func (r request) receiveFile(clnt pool.Object, objectAddress *object.Address) {
 	r.Response.Header.Set("X-Owner-Id", obj.OwnerID().String())
 	r.Response.Header.Set("X-Container-Id", obj.ContainerID().String())
 
-	if len(contentType) == 0 {
-		if readDetector.err != nil {
-			r.log.Error("could not read object", zap.Error(err))
-			response.Error(r.RequestCtx, "could not read object", fasthttp.StatusBadRequest)
-			return
-		}
-		readDetector.Wait()
-		contentType = readDetector.contentType
-	}
-	r.SetContentType(contentType)
+	//if len(contentType) == 0 {
+	//	if readDetector.err != nil {
+	//		r.log.Error("could not read object", zap.Error(err))
+	//		response.Error(r.RequestCtx, "could not read object", fasthttp.StatusBadRequest)
+	//		return
+	//	}
+	//	readDetector.Wait()
+	//	contentType = readDetector.contentType
+	//}
+	//r.SetContentType(contentType)
 
-	r.Response.Header.Set("Content-Disposition", dis+"; filename="+path.Base(filename))
+	//r.Response.Header.Set("Content-Disposition", dis+"; filename="+path.Base(filename))
 }
 
 // systemBackwardTranslator is used to convert headers looking like '__NEOFS__ATTR_NAME' to 'Neofs-Attr-Name'.
@@ -212,13 +212,6 @@ func systemBackwardTranslator(key string) string {
 	}
 
 	return res.String()
-}
-
-func bearerOpts(ctx context.Context) pool.CallOption {
-	if tkn, err := tokens.LoadBearerToken(ctx); err == nil {
-		return pool.WithBearer(tkn)
-	}
-	return pool.WithBearer(nil)
 }
 
 func (r *request) handleNeoFSErr(err error, start time.Time) {
@@ -255,8 +248,10 @@ func (o objectIDs) Slice() []string {
 
 // Downloader is a download request handler.
 type Downloader struct {
-	log      *zap.Logger
-	pool     pool.Pool
+	neoFS NeoFS
+
+	logger *zap.Logger
+
 	settings Settings
 }
 
@@ -264,124 +259,135 @@ type Settings struct {
 	ZipCompression bool
 }
 
-// New creates an instance of Downloader using specified options.
-func New(log *zap.Logger, settings Settings, conns pool.Pool) (*Downloader, error) {
-	var err error
-	d := &Downloader{log: log, pool: conns, settings: settings}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get neofs client's reusable artifacts: %w", err)
-	}
-	return d, nil
+func failRequest(ctx *fasthttp.RequestCtx, msg string) {
+	failRequestWithCode(ctx, msg, fasthttp.StatusBadRequest)
 }
 
-func (d *Downloader) newRequest(ctx *fasthttp.RequestCtx, log *zap.Logger) *request {
-	return &request{
-		RequestCtx: ctx,
-		log:        log,
+func failNotFound(ctx *fasthttp.RequestCtx) {
+	failRequestWithCode(ctx, "object not found", fasthttp.StatusNotFound)
+}
+
+func failRequestWithCode(ctx *fasthttp.RequestCtx, msg string, code int) {
+	response.Error(ctx, msg, code)
+}
+
+const (
+	_ uint8 = iota
+	byID
+	byAttr
+	byFile
+)
+
+func (x *Downloader) read(c *fasthttp.RequestCtx, selector uint8, head bool) {
+	// init reader
+	rObj := x.neoFS.InitObjectRead(c)
+
+	// bind container
+	sCnr, _ := c.UserValue("cid").(string)
+
+	var fail bool
+
+	rObj.FromContainer(&fail, sCnr)
+	if fail {
+		failRequest(c, "incorrect container ID")
+		return
 	}
+
+	// read bearer token
+	switch encodedBearer := []byte(nil); tokens.ReadBearer(&encodedBearer, &c.Request.Header) {
+	case -1:
+		failRequest(c, "incorrect bearer token header")
+		return
+	case 1:
+		if rObj.UseBearerToken(&fail, encodedBearer); fail {
+			failRequest(c, "incorrect bearer token JSON")
+			return
+		}
+	}
+
+	// select objects
+	switch selector {
+	case byID:
+		sObj, _ := c.UserValue("oid").(string)
+
+		rObj.ByID(&fail, sObj)
+		if fail {
+			failRequest(c, "incorrect object ID")
+			return
+		}
+
+		c.Response.Header.Set("X-Object-Id", sObj)
+	case byAttr:
+		key, _ := url.QueryUnescape(c.UserValue("attr_key").(string))
+		val, _ := url.QueryUnescape(c.UserValue("attr_val").(string))
+
+		switch rObj.ByAttribute(key, val) {
+		case -1:
+			failRequest(c, "select by attribute failed")
+			return
+		case 0:
+			failNotFound(c)
+			return
+		}
+	case byFile:
+		prefix, _ := url.QueryUnescape(c.UserValue("prefix").(string))
+
+		switch rObj.ByFilenamePrefix(prefix) {
+		case -1:
+			failRequest(c, "select by filename prefix failed")
+			return
+		case 0:
+			failNotFound(c)
+			return
+		}
+	}
+
+	// distinguish HEAD
+	if head {
+		rObj.Head()
+	}
+
+	// perform reading
+	var res ResRead
+
+	res.reqCtx = c
+
+loop:
+	for {
+		switch rObj.ReadNext(&res); res.status {
+		case 1:
+			break loop
+		case 2:
+			failRequest(c, "read object failed")
+			return
+		case 3:
+			failNotFound(c)
+			return
+		}
+	}
+
+	// set remaining headers
+	c.Response.Header.Set("X-Container-Id", sCnr)
 }
 
 // DownloadByAddress handles download requests using simple cid/oid format.
-func (d *Downloader) DownloadByAddress(c *fasthttp.RequestCtx) {
-	d.byAddress(c, request.receiveFile)
+func (x *Downloader) DownloadByAddress(c *fasthttp.RequestCtx) {
+	x.read(c, byID, false)
 }
 
-// byAddress is wrapper for function (e.g. request.headObject, request.receiveFile) that
-// prepares request and object address to it.
-func (d *Downloader) byAddress(c *fasthttp.RequestCtx, f func(request, pool.Object, *object.Address)) {
-	var (
-		address = object.NewAddress()
-		cid, _  = c.UserValue("cid").(string)
-		oid, _  = c.UserValue("oid").(string)
-		val     = strings.Join([]string{cid, oid}, "/")
-		log     = d.log.With(zap.String("cid", cid), zap.String("oid", oid))
-	)
-	if err := address.Parse(val); err != nil {
-		log.Error("wrong object address", zap.Error(err))
-		response.Error(c, "wrong object address", fasthttp.StatusBadRequest)
-		return
-	}
-
-	f(*d.newRequest(c, log), d.pool, address)
+// HeadByAddress handles head requests using simple cid/oid format.
+func (x *Downloader) HeadByAddress(c *fasthttp.RequestCtx) {
+	x.read(c, byID, true)
 }
 
 // DownloadByAttribute handles attribute-based download requests.
-func (d *Downloader) DownloadByAttribute(c *fasthttp.RequestCtx) {
-	d.byAttribute(c, request.receiveFile)
+func (x *Downloader) DownloadByAttribute(c *fasthttp.RequestCtx) {
+	x.read(c, byAttr, false)
 }
 
-// byAttribute is wrapper similar to byAddress.
-func (d *Downloader) byAttribute(c *fasthttp.RequestCtx, f func(request, pool.Object, *object.Address)) {
-	var (
-		httpStatus = fasthttp.StatusBadRequest
-		scid, _    = c.UserValue("cid").(string)
-		key, _     = url.QueryUnescape(c.UserValue("attr_key").(string))
-		val, _     = url.QueryUnescape(c.UserValue("attr_val").(string))
-		log        = d.log.With(zap.String("cid", scid), zap.String("attr_key", key), zap.String("attr_val", val))
-	)
-	containerID := cid.New()
-	if err := containerID.Parse(scid); err != nil {
-		log.Error("wrong container id", zap.Error(err))
-		response.Error(c, "wrong container id", httpStatus)
-		return
-	}
-
-	address, err := d.searchObject(c, log, containerID, key, val)
-	if err != nil {
-		log.Error("couldn't search object", zap.Error(err))
-		if errors.Is(err, errObjectNotFound) {
-			httpStatus = fasthttp.StatusNotFound
-		}
-		response.Error(c, "couldn't search object", httpStatus)
-		return
-	}
-
-	f(*d.newRequest(c, log), d.pool, address)
-}
-
-func (d *Downloader) searchObject(c *fasthttp.RequestCtx, log *zap.Logger, cid *cid.ID, key, val string) (*object.Address, error) {
-	ids, err := d.searchByAttr(c, cid, key, val)
-	if err != nil {
-		return nil, err
-	}
-	if len(ids) > 1 {
-		log.Debug("found multiple objects",
-			zap.Strings("object_ids", objectIDs(ids).Slice()),
-			zap.Stringer("show_object_id", ids[0]))
-	}
-
-	return formAddress(cid, ids[0]), nil
-}
-
-func formAddress(cid *cid.ID, oid *object.ID) *object.Address {
-	address := object.NewAddress()
-	address.SetContainerID(cid)
-	address.SetObjectID(oid)
-	return address
-}
-
-func (d *Downloader) search(c *fasthttp.RequestCtx, cid *cid.ID, key, val string, op object.SearchMatchType) ([]*object.ID, error) {
-	options := object.NewSearchFilters()
-	options.AddRootFilter()
-	options.AddFilter(key, val, op)
-
-	sops := new(client.SearchObjectParams).WithContainerID(cid).WithSearchFilters(options)
-	ids, err := d.pool.SearchObject(c, sops)
-	if err != nil {
-		return nil, err
-	}
-	if len(ids) == 0 {
-		return nil, errObjectNotFound
-	}
-	return ids, nil
-}
-
-func (d *Downloader) searchByPrefix(c *fasthttp.RequestCtx, cid *cid.ID, val string) ([]*object.ID, error) {
-	return d.search(c, cid, object.AttributeFileName, val, object.MatchCommonPrefix)
-}
-
-func (d *Downloader) searchByAttr(c *fasthttp.RequestCtx, cid *cid.ID, key, val string) ([]*object.ID, error) {
-	return d.search(c, cid, key, val, object.MatchStringEqual)
+// HeadByAttribute handles attribute-based head requests.
+func (x *Downloader) HeadByAttribute(c *fasthttp.RequestCtx) {
+	x.read(c, byAttr, true)
 }
 
 // DownloadZipped handles zip by prefix requests.

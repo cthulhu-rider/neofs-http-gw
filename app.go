@@ -7,6 +7,8 @@ import (
 	"math"
 	"strconv"
 
+	"github.com/nspcc-dev/neofs-sdk-go/owner"
+
 	"github.com/fasthttp/router"
 	"github.com/nspcc-dev/neo-go/cli/flags"
 	"github.com/nspcc-dev/neo-go/cli/input"
@@ -194,8 +196,30 @@ func (a *app) Serve(ctx context.Context) {
 		a.log.Info("shutting down web server", zap.Error(a.webServer.Shutdown()))
 		close(a.webDone)
 	}()
-	edts := a.cfg.GetBool(cfgUploaderHeaderEnableDefaultTimestamp)
-	uploader := uploader.New(a.log, a.pool, edts)
+
+	// initialize uploader
+	key, err := getNeoFSKey(a)
+	if err != nil {
+		a.log.Fatal("could not start server", zap.Error(err))
+	}
+
+	var prmInitUpldr uploader.PrmInit
+
+	prmInitUpldr.SetNeoFS(&neofs{
+		logger:       a.log,
+		clientPool:   a.pool,
+		defaultOwner: owner.NewIDFromPublicKey(&key.PublicKey),
+	})
+	prmInitUpldr.SetLogger(a.log)
+
+	if a.cfg.GetBool(cfgUploaderHeaderEnableDefaultTimestamp) {
+		prmInitUpldr.EnableDefaultTimestamping()
+	}
+
+	var upldr uploader.Uploader
+
+	upldr.Init(prmInitUpldr)
+
 	downloader, err := downloader.New(a.log, downloader.Settings{ZipCompression: a.cfg.GetBool(cfgZipCompression)}, a.pool)
 	if err != nil {
 		a.log.Fatal("failed to create downloader", zap.Error(err))
@@ -209,7 +233,7 @@ func (a *app) Serve(ctx context.Context) {
 	r.MethodNotAllowed = func(r *fasthttp.RequestCtx) {
 		response.Error(r, "Method Not Allowed", fasthttp.StatusMethodNotAllowed)
 	}
-	r.POST("/upload/{cid}", a.logger(uploader.Upload))
+	r.POST("/upload/{cid}", a.logger(upldr.Upload))
 	a.log.Info("added path /upload/{cid}")
 	r.GET("/get/{cid}/{oid}", a.logger(downloader.DownloadByAddress))
 	r.HEAD("/get/{cid}/{oid}", a.logger(downloader.HeadByAddress))

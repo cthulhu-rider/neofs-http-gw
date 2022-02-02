@@ -154,7 +154,6 @@ func Test_checkAndPropagateBearerToken(t *testing.T) {
 	require.NoError(t, StoreBearerToken(ctx))
 
 	// Expect to see the same token without errors.
-	actual, err := LoadBearerToken(ctx)
-	require.NoError(t, err)
+	actual := LoadBearerToken(ctx)
 	require.Equal(t, tkn, actual)
 }
